@@ -249,10 +249,13 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	tried := map[string]bool{}
-	// At most two bounded attempts, inside Dawarich's existing five-second timeout.
-	for attempt := 0; attempt < 2; attempt++ {
-		if req.Context().Err() != nil {
-			return
+	// Two slow providers must not hide a healthy third one. Bound the entire
+	// chain below the caller's five-second timeout, as well as each attempt.
+	ctx, cancel := context.WithTimeout(req.Context(), 4300*time.Millisecond)
+	defer cancel()
+	for attempt := 0; attempt < 4; attempt++ {
+		if ctx.Err() != nil {
+			break
 		}
 		p, e := r.reserve(time.Now(), tried)
 		if e != nil {
@@ -260,7 +263,7 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		tried[p.Name] = true
 		upstream := strings.TrimRight(p.URL, "/") + path + "?" + q.Encode()
-		out, e := http.NewRequestWithContext(req.Context(), http.MethodGet, upstream, nil)
+		out, e := http.NewRequestWithContext(ctx, http.MethodGet, upstream, nil)
 		if e != nil {
 			r.failed(p, 0, "")
 			continue

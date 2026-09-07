@@ -10,7 +10,7 @@ No database server, Redis, or geocoding dataset. Linux container; one replica.
 - GET /api and /reverse; round-robin among eligible providers.
 - Per-provider request spacing (at least 1 second) and UTC daily/monthly caps.
 - Durable quota reservation before each outbound attempt, including failed attempts.
-- Bounded failover (at most two providers), cooldowns for errors and Retry-After.
+- Bounded failover (at most four providers within 4.3 seconds total), cooldowns for errors and Retry-After.
 - File-mounted provider keys sent only as X-Api-Key to their configured provider.
 - /healthz and Prometheus /metrics. No coordinate, key or response-body logging.
 

@@ -222,3 +222,41 @@ func TestChibiGeoBasePathAndMountedKey(t *testing.T) {
 		t.Fatal(w.Code)
 	}
 }
+
+func TestTwoTimeoutsStillReachHealthyThird(t *testing.T) {
+	slow := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer slow.Close()
+	good := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"type":"FeatureCollection","features":[]}`)
+	}))
+	defer good.Close()
+	a, b, c := p("a"), p("b"), p("c")
+	a.URL, b.URL, c.URL = slow.URL, slow.URL, good.URL
+	r := fixture(t, a, b, c)
+	r.client = slow.Client()
+	r.client.Timeout = 100 * time.Millisecond
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/reverse?lat=0&lon=0", nil))
+	if w.Code != 200 || r.failures["a"] != 1 || r.failures["b"] != 1 || r.successes["c"] != 1 {
+		t.Fatalf("status=%d failures=%v successes=%v", w.Code, r.failures, r.successes)
+	}
+}
+
+func TestWholeFailoverChainHasDeadline(t *testing.T) {
+	slow := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer slow.Close()
+	a := p("a")
+	a.URL = slow.URL
+	r := fixture(t, a)
+	r.client = slow.Client() // No per-attempt timeout: test the outer deadline.
+	start := time.Now()
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/reverse?lat=0&lon=0", nil))
+	if elapsed := time.Since(start); w.Code != 503 || elapsed > 5*time.Second {
+		t.Fatalf("status=%d elapsed=%s", w.Code, elapsed)
+	}
+}
