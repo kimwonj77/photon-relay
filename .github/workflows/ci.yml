@@ -25,6 +25,7 @@ jobs:
           docker run -d --name relay-test -p 127.0.0.1:18080:8080 --tmpfs /data:uid=10001,gid=10001,mode=0700 -v "$RUNNER_TEMP/providers.json:/config/providers.json:ro" photon-relay:test
           trap 'docker rm -f relay-test' EXIT
           curl --fail --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18080/healthz
+          curl --fail http://127.0.0.1:18080/metrics | docker run --rm -i --entrypoint /bin/promtool prom/prometheus:v3.14.0 check metrics
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test

@@ -55,7 +55,62 @@ later attempts preserve an 800 ms fallback window where possible. Distant provid
 When all providers are unavailable or capped, clients receive 503, not fake empty data.
 A valid empty FeatureCollection is returned without retry.
 
-## Development and release
+## Durable daily accounting and metrics
+
+State remains a small JSON file on persistent storage, not SQLite or a separate DB.
+Each provider has schema version 1, UTC day/month usage, pre-tracking baseline,
+lifetime admitted attempts/results, latency buckets, and the last 35 recorded usage
+days. Day/month views reset on UTC calendar boundaries even when idle; the next
+admission archives the prior day. Clock regression cannot reopen an allowance.
+State is locked per process, written to a temporary file, fsynced, renamed and its
+directory fsynced. Failed persistence stops new upstream calls.
+
+Version 0 state is migrated without clearing quota. The original bytes are retained
+once at STATE_FILE.pre-v1 before the migrated file is saved. Existing usage becomes
+a baseline: it may include external usage or a conservative first-day reservation,
+so it is NOT advertised as newly observed traffic. Keep both files and the PVC.
+This checkpoint is not an off-node backup. Do not restore old quota snapshots while
+spending the same account allowance, or downgrade to 0.1.x: old binaries discard
+new history/result fields on their next write.
+
+Metrics use Prometheus text 0.0.4 with HELP/TYPE declarations and cumulative histogram
+buckets; CI validates the endpoint with promtool. Provider names and fixed outcomes
+are the only provider-series labels. No URLs, coordinates, API keys or user labels.
+
+| Metric (prefix photon_relay_) | Meaning |
+|---|---|
+| daily_quota_used / monthly_quota_used | Budget charged, INCLUDING baseline reservations |
+| daily_quota_baseline / monthly_quota_baseline | Pre-tracking/external reservation, NOT observed requests |
+| daily_requests / monthly_requests | New admitted attempts in the current period, excluding baseline |
+| attempts_total | Durable admitted attempts since schema upgrade |
+| success_total / failure_total / outcomes_total | Durable observed results and fixed failure categories |
+| upstream_request_duration_seconds | Durable histogram, including failed attempt latency |
+| daily_remaining / monthly_remaining | Remaining local allowance; -1 means no local cap |
+| quota_reset_timestamp_seconds | Next UTC day/month boundary; midnight UTC is 09:00 KST |
+| eligible / next_eligible_timestamp_seconds / cooldown_until_seconds | Current eligibility and cooldown; not an uptime guarantee |
+| last_success_timestamp_seconds / last_failure_timestamp_seconds / last_http_status | Last observed outcome; timestamp/status 0 means none |
+| quota_storage_healthy / quota_state_write_errors_total / quota_state_size_bytes | Persistence health, write errors and file size |
+| client_requests_total / inflight_requests / process_start_time_seconds | Client responses, current concurrency and process start; probes excluded |
+
+Admitted attempts are persisted BEFORE sending. A crash in between may overcount a
+network request; a crash before outcome persistence may miss the last result. There
+is no exactly-once guarantee across an external API. Provider counters/histograms
+survive restarts; client response and write-error counters restart with the process.
+Daily/monthly request metrics are gauges, not counters: use attempts_total for rates.
+Version 0.1's daily_requests included baseline; 0.2 separates it explicitly.
+
+Useful PromQL (filter by your job/namespace as appropriate):
+
+```promql
+sum by (provider) (rate(photon_relay_attempts_total[5m]))
+sum by (provider, outcome) (increase(photon_relay_outcomes_total[1h]))
+histogram_quantile(0.95, sum by (provider, le) (rate(photon_relay_upstream_request_duration_seconds_bucket[15m])))
+photon_relay_daily_remaining
+```
+
+See [Prometheus exposition rules](https://prometheus.io/docs/instrumenting/exposition_formats/).
+
+## Development and release commands
 
 go test -race ./...
 go vet ./...

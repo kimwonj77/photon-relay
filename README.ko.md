@@ -55,7 +55,61 @@ PHOTON_API_USE_HTTPS=false로 연결합니다. 제공자 키는 클라이언트�
 전체 제공자가 사용 불가·한도 초과면 가짜 빈 데이터 대신 503을 반환합니다.
 정상적인 빈 FeatureCollection은 재시도 없이 그대로 반환합니다.
 
-## 개발·릴리스
+## 영속 일별 집계와 메트릭
+
+별도 DB나 SQLite 대신 영속 저장소의 작은 JSON 파일을 사용합니다.
+제공자마다 스키마 버전 1, UTC 일·월 사용량, 이전 집계 기준량, 누적 시도·결과,
+지연시간 버킷, 최근 사용 기록이 있는 35일의 집계를 저장합니다.
+요청이 없는 동안에도 일·월 표시값은 UTC 경계에 초기화되며 다음 요청 승인 때
+이전 날짜를 기록합니다. 시계가 뒤로 가도 한도를 다시 열지 않습니다.
+프로세스 잠금, 임시 파일 쓰기, fsync, rename, 디렉터리 fsync를 사용하고
+저장 실패 시 새 외부 요청을 중단합니다.
+
+버전 0 상태는 한도를 지우지 않고 이전합니다. 원본은 STATE_FILE.pre-v1에
+한 번 보존한 뒤 새 상태를 저장합니다. 기존 사용량은 외부 소비량·첫날의 보수적
+예약을 포함할 수 있으므로 새로 관측한 트래픽으로 표시하지 않습니다.
+두 파일과 PVC를 보존하세요. 이 체크포인트는 외부 백업이 아닙니다.
+같은 계정 한도를 소비하는 중에 오래된 쿼터를 복원하지 마세요.
+0.1.x로 내리면 다음 쓰기에서 새 일별 기록·결과 필드가 사라지므로 다운그레이드하지 마세요.
+
+메트릭은 HELP/TYPE 선언과 누적 히스토그램을 포함한 Prometheus text 0.0.4이며
+CI에서 promtool로 실제 엔드포인트를 검사합니다. 제공자 시리즈 라벨은 제공자명과
+고정 결과 분류뿐이며 URL·좌표·API 키·사용자 라벨은 포함하지 않습니다.
+
+| 메트릭 (photon_relay_ 접두사) | 의미 |
+|---|---|
+| daily_quota_used / monthly_quota_used | 기준 예약량을 포함한 사용 예산 |
+| daily_quota_baseline / monthly_quota_baseline | 이전 집계·외부 예약량이며 관측 요청 수가 아님 |
+| daily_requests / monthly_requests | 기준량을 제외한 현재 기간의 신규 승인 시도 |
+| attempts_total | 스키마 이전 이후의 영속 누적 승인 시도 |
+| success_total / failure_total / outcomes_total | 영속 관측 결과와 고정 실패 분류 |
+| upstream_request_duration_seconds | 실패 지연도 포함한 영속 히스토그램 |
+| daily_remaining / monthly_remaining | 남은 로컬 예산; -1은 로컬 상한 없음 |
+| quota_reset_timestamp_seconds | 다음 UTC 일·월 경계; UTC 자정은 KST 09:00 |
+| eligible / next_eligible_timestamp_seconds / cooldown_until_seconds | 현재 사용 가능 여부와 대기; 가동률 보장은 아님 |
+| last_success_timestamp_seconds / last_failure_timestamp_seconds / last_http_status | 마지막 관측 결과; 시각·상태 0은 없음 |
+| quota_storage_healthy / quota_state_write_errors_total / quota_state_size_bytes | 저장 상태·쓰기 오류·파일 크기 |
+| client_requests_total / inflight_requests / process_start_time_seconds | 클라이언트 응답·동시 요청·프로세스 시작; probe 제외 |
+
+시도 승인은 전송 전에 저장합니다. 그 사이 프로세스가 죽으면 실제 전송보다
+많이 집계할 수 있고, 결과 저장 전에 죽으면 마지막 결과가 누락될 수 있습니다.
+외부 API와 exactly-once를 보장하지 않습니다. 제공자 카운터·히스토그램은
+재시작 후 보존되며 클라이언트 응답·쓰기 오류 카운터는 프로세스마다 새로 시작합니다.
+일·월 요청 메트릭은 gauge이므로 속도 계산에는 attempts_total을 사용하세요.
+0.1의 daily_requests는 기준 예약량을 포함했지만 0.2부터 명확히 분리합니다.
+
+PromQL 예시(환경에 맞게 job/namespace 필터 추가):
+
+```promql
+sum by (provider) (rate(photon_relay_attempts_total[5m]))
+sum by (provider, outcome) (increase(photon_relay_outcomes_total[1h]))
+histogram_quantile(0.95, sum by (provider, le) (rate(photon_relay_upstream_request_duration_seconds_bucket[15m])))
+photon_relay_daily_remaining
+```
+
+[Prometheus 출력 규칙](https://prometheus.io/docs/instrumenting/exposition_formats/)을 참고하세요.
+
+## 개발·릴리스 명령
 
 go test -race ./...
 go vet ./...
