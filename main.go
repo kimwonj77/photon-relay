@@ -70,24 +70,45 @@ var durationBounds = [...]float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 var outcomeNames = []string{"success", "timeout", "network_error", "canceled", "rate_limited", "upstream_4xx", "upstream_5xx", "invalid_response", "request_error"}
 
 type Config struct {
-	Providers []Provider `json:"providers"`
+	RecentData    RecentDataConfig `json:"recent_data,omitempty"`
+	SelectionMode string           `json:"selection_mode,omitempty"`
+	Providers     []Provider       `json:"providers"`
+}
+type RecentDataConfig struct {
+	Granularity string `json:"granularity,omitempty"`
 }
 type Relay struct {
-	mu                  sync.Mutex
-	providers           []Provider
-	usage               map[string]Usage
-	cursor              int
-	state               string
-	broken              bool
-	client              *http.Client
-	slots               chan struct{}
-	successes, failures map[string]int
-	clientResponses     map[int]uint64
-	started             time.Time
-	writeFailures       uint64
+	recentDataGranularity string
+	selectionMode         string
+	mu                    sync.Mutex
+	providers             []Provider
+	usage                 map[string]Usage
+	cursor                int
+	state                 string
+	broken                bool
+	client                *http.Client
+	slots                 chan struct{}
+	successes, failures   map[string]int
+	clientResponses       map[int]uint64
+	started               time.Time
+	writeFailures         uint64
 }
 
 func newRelay(c Config, state string) (*Relay, error) {
+	if c.SelectionMode == "" {
+		c.SelectionMode = "round_robin"
+	}
+	if c.SelectionMode != "round_robin" && c.SelectionMode != "recent_data" {
+		return nil, errors.New("unsupported selection_mode")
+	}
+	if c.RecentData.Granularity == "" {
+		c.RecentData.Granularity = "month"
+	}
+	switch c.RecentData.Granularity {
+	case "year", "month", "day", "time":
+	default:
+		return nil, errors.New("unsupported recent_data.granularity")
+	}
 	if len(c.Providers) == 0 {
 		return nil, errors.New("no providers")
 	}
@@ -112,6 +133,8 @@ func newRelay(c Config, state string) (*Relay, error) {
 	}
 	r := &Relay{providers: c.Providers, usage: map[string]Usage{}, state: state, slots: make(chan struct{}, 4), successes: map[string]int{}, failures: map[string]int{}, client: &http.Client{Timeout: 2500 * time.Millisecond, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	r.clientResponses = map[int]uint64{}
+	r.selectionMode = c.SelectionMode
+	r.recentDataGranularity = c.RecentData.Granularity
 	r.started = time.Now()
 	b, e := os.ReadFile(state)
 	if e == nil {
@@ -205,6 +228,48 @@ func atomicWrite(path string, b []byte) error {
 	defer d.Close()
 	return d.Sync()
 }
+
+// candidateOrder only ranks providers. Admission, pacing and durable accounting
+// remain shared by every selection mode. Caller holds mu.
+func (r *Relay) candidateOrder() []int {
+	order := make([]int, len(r.providers))
+	for n := range order {
+		order[n] = (r.cursor + n) % len(r.providers)
+	}
+	if r.selectionMode == "recent_data" {
+		date := func(i int) time.Time {
+			p := r.providers[i]
+			if !p.StatusEnabled {
+				return time.Time{}
+			}
+			return dataBucket(r.usage[p.Name].DataUpdated, r.recentDataGranularity)
+		}
+		// Stable sorting retains round-robin fairness for equal/unknown dates.
+		// A failed metadata refresh retains the last known import date.
+		sort.SliceStable(order, func(a, b int) bool {
+			return date(order[a]).After(date(order[b]))
+		})
+	}
+	return order
+}
+
+func dataBucket(t time.Time, granularity string) time.Time {
+	if t.IsZero() {
+		return t
+	}
+	t = t.UTC()
+	switch granularity {
+	case "year":
+		return time.Date(t.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	case "month", "":
+		return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+	case "day":
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	default: // validated "time"
+		return t
+	}
+}
+
 func (r *Relay) reserve(now time.Time, tried map[string]bool) (Provider, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -212,8 +277,7 @@ func (r *Relay) reserve(now time.Time, tried map[string]bool) (Provider, error) 
 		return Provider{}, errors.New("quota storage unavailable")
 	}
 	now = now.UTC()
-	for n := 0; n < len(r.providers); n++ {
-		i := (r.cursor + n) % len(r.providers)
+	for _, i := range r.candidateOrder() {
 		p := r.providers[i]
 		u := r.usage[p.Name]
 		if tried[p.Name] {
@@ -573,6 +637,10 @@ func (r *Relay) metricsAt(w http.ResponseWriter, now time.Time) {
 		meta(name, kind, help)
 		fmt.Fprintf(w, "photon_relay_%s %g\n", name, value)
 	}
+	meta("selection_mode_info", "gauge", "Configured provider selection mode.")
+	fmt.Fprintf(w, "photon_relay_selection_mode_info{mode=%q} 1\n", r.selectionMode)
+	meta("recent_data_granularity_info", "gauge", "Configured UTC dataset date granularity; used only in recent_data mode.")
+	fmt.Fprintf(w, "photon_relay_recent_data_granularity_info{granularity=%q} 1\n", r.recentDataGranularity)
 	boolean := func(b bool) float64 {
 		if b {
 			return 1

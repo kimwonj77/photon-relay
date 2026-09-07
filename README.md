@@ -14,6 +14,36 @@ No database server, Redis, or geocoding dataset. Linux container; one replica.
 - File-mounted provider keys sent only as X-Api-Key to their configured provider.
 - /healthz and Prometheus /metrics. No coordinate, key or response-body logging.
 
+## Provider selection (0.2.2)
+
+Set top-level `"selection_mode": "round_robin"` (default when omitted) or
+`"selection_mode": "recent_data"`. Unknown modes fail startup.
+Round-robin rotates eligible providers. Recent-data prefers the newest known
+Photon `import_date` at the configured UTC granularity; ties rotate and unknown/disabled metadata ranks last.
+
+```json
+{"selection_mode":"recent_data","recent_data":{"granularity":"month"}}
+```
+
+`recent_data.granularity`: `year` compares calendar years, `month` (default)
+compares year/month, `day` compares the full calendar date, and `time` compares
+the complete timestamp. For example August 8 and August 29 tie in month mode;
+January and August do not. All boundaries use UTC, not the host timezone.
+Invalid granularity fails startup. `photon_relay_recent_data_granularity_info`
+exposes the configured value; it has no effect in round-robin mode.
+A failed metadata refresh retains the last known date and its visible failure flag.
+Before the first successful check, unknown dates rotate normally.
+This is provider dataset freshness, not point/job timestamp priority.
+Older providers remain fallback candidates; no maximum dataset age is imposed.
+
+All modes share pacing, cooldown, tried-provider exclusion, durable quota admission
+and existing bounded failover. A capped or busy newest provider is skipped without
+waiting; traffic can concentrate on the newest provider up to its configured limits.
+Selection ranking is isolated in `candidateOrder` for future modes; only the two
+named modes are currently supported. Change configuration and restart the single
+replica with its existing state volume. No state migration or quota reset is needed.
+`photon_relay_selection_mode_info{mode="…"} 1` exposes the active mode.
+
 ## Configuration
 
 Copy providers.example.json to providers.json and replace the placeholder Photon URL
@@ -65,7 +95,8 @@ or retries. The check timestamp and last good import date persist in the existin
 JSON state. `/metrics` never triggers upstream traffic. Status checks are separate
 from geocoding attempt quotas/counters; keep this disabled for paid API providers
 unless their public metadata endpoint is explicitly supported. Failed checks retain
-the last known date, but report failure. This does not change routing or reject old data.
+the last known date, but report failure. Recent-data mode uses that retained date;
+round-robin ignores dates. Neither mode rejects providers just for old data.
 
 Metrics: `photon_relay_upstream_data_timestamp_seconds` (absent if unknown),
 `photon_relay_upstream_metadata_enabled`, `photon_relay_upstream_metadata_success`,

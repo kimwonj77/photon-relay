@@ -1,4 +1,6 @@
 {
+  "selection_mode": "round_robin",
+  "recent_data": {"granularity": "month"},
   "providers": [
     {
       "name": "photon",

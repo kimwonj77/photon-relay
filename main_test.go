@@ -15,6 +15,141 @@ import (
 	"time"
 )
 
+func TestRecentDataGranularity(t *testing.T) {
+	parse := func(s string) time.Time {
+		v, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	for _, tc := range []struct {
+		granularity, older, newer string
+		equal                     bool
+	}{
+		{"year", "2025-12-31T23:59:59Z", "2026-01-01T00:00:00Z", false},
+		{"year", "2026-01-01T00:00:00Z", "2026-12-31T23:59:59Z", true},
+		{"month", "2026-08-01T00:00:00Z", "2026-08-29T23:00:00Z", true},
+		{"month", "2026-08-31T23:59:59Z", "2026-09-01T00:00:00Z", false},
+		{"day", "2024-02-29T00:00:00Z", "2024-02-29T23:59:59Z", true},
+		{"day", "2024-02-29T23:59:59Z", "2024-03-01T00:00:00Z", false},
+		{"time", "2026-08-29T00:00:00Z", "2026-08-29T00:00:01Z", false},
+		{"month", "2026-08-31T23:30:00Z", "2026-09-01T08:30:00+09:00", true},
+	} {
+		t.Run(tc.granularity+tc.newer, func(t *testing.T) {
+			a, b := p("a"), p("b")
+			a.StatusEnabled, b.StatusEnabled = true, true
+			r, err := newRelay(Config{SelectionMode: "recent_data", RecentData: RecentDataConfig{Granularity: tc.granularity}, Providers: []Provider{a, b}}, filepath.Join(t.TempDir(), "quota.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.usage["a"] = Usage{DataUpdated: parse(tc.older)}
+			r.usage["b"] = Usage{DataUpdated: parse(tc.newer)}
+			want := 1
+			if tc.equal {
+				want = 0
+			}
+			if got := r.candidateOrder()[0]; got != want {
+				t.Fatalf("first %d want %d", got, want)
+			}
+			r.cursor = 1
+			if r.candidateOrder()[0] != 1 {
+				t.Fatal("tie rotation/newest preference lost")
+			}
+		})
+	}
+	r, err := newRelay(Config{SelectionMode: "recent_data", Providers: []Provider{p("a")}}, filepath.Join(t.TempDir(), "quota.json"))
+	if err != nil || r.recentDataGranularity != "month" {
+		t.Fatal("default must be month", err)
+	}
+	w := httptest.NewRecorder()
+	r.metricsAt(w, time.Now())
+	if !strings.Contains(w.Body.String(), `photon_relay_recent_data_granularity_info{granularity="month"} 1`) {
+		t.Fatal("missing granularity metric")
+	}
+	if _, err := newRelay(Config{RecentData: RecentDataConfig{Granularity: "typo"}, Providers: []Provider{p("a")}}, filepath.Join(t.TempDir(), "quota.json")); err == nil {
+		t.Fatal("unknown granularity accepted")
+	}
+	if !dataBucket(time.Time{}, "year").IsZero() {
+		t.Fatal("unknown date must stay unknown")
+	}
+}
+
+func TestSelectionModes(t *testing.T) {
+	now := time.Date(2026, 9, 8, 1, 0, 0, 0, time.UTC)
+	for _, mode := range []string{"", "round_robin", "recent_data"} {
+		t.Run(mode, func(t *testing.T) {
+			a, b, c := p("old"), p("new"), p("unknown")
+			a.StatusEnabled, b.StatusEnabled = true, true
+			r, err := newRelay(Config{SelectionMode: mode, RecentData: RecentDataConfig{Granularity: "time"}, Providers: []Provider{a, b, c}}, filepath.Join(t.TempDir(), "quota.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.usage["old"] = Usage{DataUpdated: now.Add(-48 * time.Hour)}
+			r.usage["new"] = Usage{DataUpdated: now.Add(-24 * time.Hour)}
+			want := []string{"old", "new", "unknown"}
+			if mode == "recent_data" {
+				want = []string{"new", "old", "unknown"}
+			}
+			for _, name := range want {
+				got, err := r.reserve(now, nil) // pacing excludes previous choices
+				if err != nil || got.Name != name {
+					t.Fatalf("want %s got %s: %v", name, got.Name, err)
+				}
+			}
+			r2, err := newRelay(Config{SelectionMode: mode, RecentData: RecentDataConfig{Granularity: "time"}, Providers: r.providers}, r.state)
+			if err != nil || r2.usage["new"].Attempts != 1 {
+				t.Fatal("restart lost accounting", err)
+			}
+			got, err := r2.reserve(now.Add(time.Second), map[string]bool{"old": true})
+			if err != nil || got.Name != "new" {
+				t.Fatal("persisted date or tried exclusion lost", got, err)
+			}
+		})
+	}
+	if _, err := newRelay(Config{SelectionMode: "typo", Providers: []Provider{p("a")}}, filepath.Join(t.TempDir(), "quota.json")); err == nil {
+		t.Fatal("unknown mode accepted")
+	}
+}
+
+func TestRecentDataTiesAndAdmission(t *testing.T) {
+	now := time.Date(2026, 9, 8, 1, 0, 0, 0, time.UTC)
+	for _, blocked := range []string{"daily", "monthly", "cooldown", "tried", "disabled"} {
+		t.Run(blocked, func(t *testing.T) {
+			r := fixture(t, p("new"), p("a"), p("b"))
+			r.selectionMode = "recent_data"
+			r.recentDataGranularity = "time"
+			for i := range r.providers {
+				r.providers[i].StatusEnabled = true
+			}
+			u := Usage{Day: now.Format("2006-01-02"), Month: now.Format("2006-01"), DataUpdated: now}
+			tried := map[string]bool{}
+			switch blocked {
+			case "daily":
+				u.Daily = 2
+			case "monthly":
+				u.Monthly = 3
+			case "cooldown":
+				u.Cooldown = now.Add(time.Hour)
+			case "tried":
+				tried["new"] = true
+			case "disabled":
+				r.providers[0].StatusEnabled = false
+			}
+			r.usage["new"] = u
+			for _, name := range []string{"a", "b"} {
+				r.usage[name] = Usage{DataUpdated: now.Add(-time.Hour)}
+			}
+			for i, want := range []string{"a", "b", "a", "b"} {
+				got, err := r.reserve(now.Add(time.Duration(i)*time.Second), tried)
+				if err != nil || got.Name != want {
+					t.Fatalf("want %s got %s: %v", want, got.Name, err)
+				}
+			}
+		})
+	}
+}
+
 func TestMetadataCachedAndIndependentOfGeocoding(t *testing.T) {
 	var calls atomic.Int32
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
