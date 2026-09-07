@@ -57,6 +57,23 @@ A valid empty FeatureCollection is returned without retry.
 
 ## Durable daily accounting and metrics
 
+### Upstream data dates (0.2.1)
+
+Opt in per public provider with `"status_enabled": true`. A background check reads
+`/status` at most once per 24 hours (hourly scheduler), with no credentials, redirects,
+or retries. The check timestamp and last good import date persist in the existing
+JSON state. `/metrics` never triggers upstream traffic. Status checks are separate
+from geocoding attempt quotas/counters; keep this disabled for paid API providers
+unless their public metadata endpoint is explicitly supported. Failed checks retain
+the last known date, but report failure. This does not change routing or reject old data.
+
+Metrics: `photon_relay_upstream_data_timestamp_seconds` (absent if unknown),
+`photon_relay_upstream_metadata_enabled`, `photon_relay_upstream_metadata_success`,
+`photon_relay_upstream_metadata_checked_timestamp_seconds`, and
+`photon_relay_upstream_metadata_last_success_timestamp_seconds`.
+Data age is `time() - photon_relay_upstream_data_timestamp_seconds`; check metadata
+success and check age separately. No provider date strings become metric labels.
+
 State remains a small JSON file on persistent storage, not SQLite or a separate DB.
 Each provider has schema version 1, UTC day/month usage, pre-tracking baseline,
 lifetime admitted attempts/results, latency buckets, and the last 35 recorded usage

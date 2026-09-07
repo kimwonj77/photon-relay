@@ -25,35 +25,40 @@ import (
 )
 
 type Provider struct {
-	Name       string `json:"name"`
-	URL        string `json:"url"`
-	KeyFile    string `json:"key_file,omitempty"`
-	IntervalMS int    `json:"interval_ms"`
-	Daily      int    `json:"daily"`
-	Monthly    int    `json:"monthly"`
-	key        string
+	StatusEnabled bool   `json:"status_enabled,omitempty"`
+	Name          string `json:"name"`
+	URL           string `json:"url"`
+	KeyFile       string `json:"key_file,omitempty"`
+	IntervalMS    int    `json:"interval_ms"`
+	Daily         int    `json:"daily"`
+	Monthly       int    `json:"monthly"`
+	key           string
 }
 type Usage struct {
-	Version         int                 `json:"version"`
-	Day             string              `json:"day"`
-	Month           string              `json:"month"`
-	Daily           int                 `json:"daily"`
-	Monthly         int                 `json:"monthly"`
-	Next            time.Time           `json:"next"`
-	Cooldown        time.Time           `json:"cooldown"`
-	DailyBaseline   int                 `json:"daily_baseline"`
-	MonthlyBaseline int                 `json:"monthly_baseline"`
-	Attempts        uint64              `json:"attempts"`
-	Successes       uint64              `json:"successes"`
-	Failures        uint64              `json:"failures"`
-	Outcomes        map[string]uint64   `json:"outcomes,omitempty"`
-	LastSuccess     time.Time           `json:"last_success"`
-	LastFailure     time.Time           `json:"last_failure"`
-	LastStatus      int                 `json:"last_status"`
-	DurationCount   uint64              `json:"duration_count"`
-	DurationSum     float64             `json:"duration_sum"`
-	DurationBuckets [8]uint64           `json:"duration_buckets"`
-	History         map[string]DayUsage `json:"history,omitempty"`
+	MetadataChecked   time.Time           `json:"metadata_checked,omitempty"`
+	MetadataSucceeded time.Time           `json:"metadata_succeeded,omitempty"`
+	MetadataOK        bool                `json:"metadata_ok,omitempty"`
+	DataUpdated       time.Time           `json:"data_updated,omitempty"`
+	Version           int                 `json:"version"`
+	Day               string              `json:"day"`
+	Month             string              `json:"month"`
+	Daily             int                 `json:"daily"`
+	Monthly           int                 `json:"monthly"`
+	Next              time.Time           `json:"next"`
+	Cooldown          time.Time           `json:"cooldown"`
+	DailyBaseline     int                 `json:"daily_baseline"`
+	MonthlyBaseline   int                 `json:"monthly_baseline"`
+	Attempts          uint64              `json:"attempts"`
+	Successes         uint64              `json:"successes"`
+	Failures          uint64              `json:"failures"`
+	Outcomes          map[string]uint64   `json:"outcomes,omitempty"`
+	LastSuccess       time.Time           `json:"last_success"`
+	LastFailure       time.Time           `json:"last_failure"`
+	LastStatus        int                 `json:"last_status"`
+	DurationCount     uint64              `json:"duration_count"`
+	DurationSum       float64             `json:"duration_sum"`
+	DurationBuckets   [8]uint64           `json:"duration_buckets"`
+	History           map[string]DayUsage `json:"history,omitempty"`
 }
 type DayUsage struct {
 	QuotaUsed int `json:"quota_used"`
@@ -490,6 +495,72 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 func (r *Relay) metrics(w http.ResponseWriter) {
 	r.metricsAt(w, time.Now().UTC())
 }
+
+// Opt-in public metadata only: never called by /metrics, never sends credentials.
+// Reserve the check timestamp durably before sending to avoid restart-driven polls.
+func (r *Relay) checkMetadata(ctx context.Context, now time.Time) {
+	for _, p := range r.providers {
+		if !p.StatusEnabled {
+			continue
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		r.mu.Lock()
+		u := r.usage[p.Name]
+		if r.broken || (!u.MetadataChecked.IsZero() && now.Sub(u.MetadataChecked) < 24*time.Hour) {
+			r.mu.Unlock()
+			continue
+		}
+		u.Version = 1
+		u.MetadataChecked, u.MetadataOK = now.UTC(), false
+		r.usage[p.Name] = u
+		err := r.save()
+		r.mu.Unlock()
+		if err != nil {
+			return
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, strings.TrimRight(p.URL, "/")+"/status", nil)
+		var updated time.Time
+		if err == nil {
+			req.Header.Set("Accept", "application/json")
+			resp, e := r.client.Do(req)
+			if e == nil {
+				b, e := io.ReadAll(io.LimitReader(resp.Body, 65537))
+				resp.Body.Close()
+				var data struct {
+					ImportDate string `json:"import_date"`
+				}
+				if resp.StatusCode == 200 && e == nil && len(b) <= 65536 && json.Unmarshal(b, &data) == nil {
+					updated, _ = time.Parse(time.RFC3339, data.ImportDate)
+					if updated.IsZero() {
+						updated, _ = time.Parse("2006-01-02", data.ImportDate)
+					}
+					if updated.Unix() <= 0 || updated.After(now.Add(5*time.Minute)) {
+						updated = time.Time{}
+					}
+				}
+			}
+		}
+		cancel()
+		r.mu.Lock()
+		u = r.usage[p.Name]
+		u.MetadataOK = !updated.IsZero()
+		if u.MetadataOK {
+			u.DataUpdated, u.MetadataSucceeded = updated.UTC(), now.UTC()
+		}
+		r.usage[p.Name] = u
+		err = r.save()
+		r.mu.Unlock()
+		if err != nil {
+			return
+		}
+		if updated.IsZero() {
+			slog.Warn("provider_metadata_unavailable", "provider", p.Name)
+		}
+	}
+}
 func (r *Relay) metricsAt(w http.ResponseWriter, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -551,6 +622,10 @@ func (r *Relay) metricsAt(w http.ResponseWriter, now time.Time) {
 		name, kind, help string
 		get              func(Provider, Usage) float64
 	}{
+		{"upstream_metadata_enabled", "gauge", "One when public status metadata polling is configured.", func(p Provider, u Usage) float64 { return boolean(p.StatusEnabled) }},
+		{"upstream_metadata_success", "gauge", "One when the latest metadata check parsed a valid date; see enabled and checked timestamp.", func(p Provider, u Usage) float64 { return boolean(p.StatusEnabled && u.MetadataOK) }},
+		{"upstream_metadata_checked_timestamp_seconds", "gauge", "Last reserved status check Unix time; zero means never checked.", func(p Provider, u Usage) float64 { return float64(max(0, u.MetadataChecked.Unix())) }},
+		{"upstream_metadata_last_success_timestamp_seconds", "gauge", "Last successful status check Unix time; zero means unknown.", func(p Provider, u Usage) float64 { return float64(max(0, u.MetadataSucceeded.Unix())) }},
 		{"daily_quota_used", "gauge", "Current UTC day quota charged, including baseline reservations.", func(p Provider, u Usage) float64 { return float64(u.Daily) }},
 		{"monthly_quota_used", "gauge", "Current UTC calendar month quota charged, including baseline reservations.", func(p Provider, u Usage) float64 { return float64(u.Monthly) }},
 		{"daily_quota_baseline", "gauge", "Current day pre-tracking or conservative external usage reservation, not observed traffic.", func(p Provider, u Usage) float64 { return float64(u.DailyBaseline) }},
@@ -589,6 +664,13 @@ func (r *Relay) metricsAt(w http.ResponseWriter, now time.Time) {
 		meta(f.name, f.kind, f.help)
 		for _, p := range r.providers {
 			fmt.Fprintf(w, "photon_relay_%s{provider=%q} %g\n", f.name, p.Name, f.get(p, view(p)))
+		}
+	}
+	meta("upstream_data_timestamp_seconds", "gauge", "Last known upstream import_date Unix timestamp; absent when unknown, not zero. Check metadata freshness separately.")
+	for _, p := range r.providers {
+		u := r.usage[p.Name]
+		if p.StatusEnabled && !u.DataUpdated.IsZero() {
+			fmt.Fprintf(w, "photon_relay_upstream_data_timestamp_seconds{provider=%q} %d\n", p.Name, u.DataUpdated.Unix())
 		}
 	}
 	meta("outcomes_total", "counter", "Durable completed attempts by bounded outcome; no coordinates or error text labels.")
@@ -653,6 +735,19 @@ func main() {
 	server := &http.Server{Addr: ":8080", Handler: r, ReadHeaderTimeout: 3 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+	go func() {
+		r.checkMetadata(ctx, time.Now().UTC())
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				r.checkMetadata(ctx, now.UTC())
+			}
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -57,6 +57,23 @@ PHOTON_API_USE_HTTPS=false로 연결합니다. 제공자 키는 클라이언트�
 
 ## 영속 일별 집계와 메트릭
 
+### 제공자 데이터 갱신일 (0.2.1)
+
+공개 제공자마다 `"status_enabled": true`로 켭니다. 백그라운드가 `/status`를
+최대 24시간에 한 번(매시간 스케줄 검사) 확인하며 인증정보·리다이렉트·재시도는
+사용하지 않습니다. 확인 시각과 마지막 정상 import_date를 기존 JSON에 보존하며
+`/metrics` 자체는 외부 요청을 만들지 않습니다. 상태 확인은 지오코딩 요청 한도·집계와
+별도입니다. 지원이 확인된 공개 상태 API가 없는 유료 제공자에서는 끄세요.
+확인 실패 시 마지막 날짜는 유지하되 실패 상태를 노출합니다. 라우팅이나 오래된 데이터
+제공자의 허용 여부는 변경하지 않습니다.
+
+메트릭: `photon_relay_upstream_data_timestamp_seconds`(모르면 없음),
+`photon_relay_upstream_metadata_enabled`, `photon_relay_upstream_metadata_success`,
+`photon_relay_upstream_metadata_checked_timestamp_seconds`,
+`photon_relay_upstream_metadata_last_success_timestamp_seconds`.
+데이터 나이는 `time() - photon_relay_upstream_data_timestamp_seconds`이며,
+확인 성공 여부·확인 시각의 경과도 따로 보세요. 날짜 문자열을 라벨로 만들지 않습니다.
+
 별도 DB나 SQLite 대신 영속 저장소의 작은 JSON 파일을 사용합니다.
 제공자마다 스키마 버전 1, UTC 일·월 사용량, 이전 집계 기준량, 누적 시도·결과,
 지연시간 버킷, 최근 사용 기록이 있는 35일의 집계를 저장합니다.

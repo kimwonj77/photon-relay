@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,49 @@ import (
 	"testing"
 	"time"
 )
+
+func TestMetadataCachedAndIndependentOfGeocoding(t *testing.T) {
+	var calls atomic.Int32
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		calls.Add(1)
+		if req.URL.Path != "/status" || req.Header.Get("X-Api-Key") != "" || req.Header.Get("Authorization") != "" {
+			t.Error("unexpected metadata request")
+		}
+		if calls.Load() == 1 {
+			fmt.Fprint(w, `{"import_date":"2026-08-29T23:00:34Z"}`)
+		} else {
+			fmt.Fprint(w, `<html>not status</html>`)
+		}
+	}))
+	defer s.Close()
+	provider := p("public")
+	provider.URL, provider.StatusEnabled = s.URL, true
+	r := fixture(t, provider, p("disabled"))
+	r.client = s.Client()
+	now := time.Date(2026, 9, 8, 1, 0, 0, 0, time.UTC)
+	r.checkMetadata(context.Background(), now)
+	if calls.Load() != 1 || !r.usage["public"].MetadataOK || r.usage["public"].Daily != 0 {
+		t.Fatal("metadata not independent")
+	}
+	w := httptest.NewRecorder()
+	r.metricsAt(w, now)
+	if !strings.Contains(w.Body.String(), `photon_relay_upstream_data_timestamp_seconds{provider="public"}`) || calls.Load() != 1 {
+		t.Fatal("metrics missing or caused polling")
+	}
+	r2, err := newRelay(Config{Providers: r.providers}, r.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2.client = s.Client()
+	r2.checkMetadata(context.Background(), now.Add(time.Hour))
+	if calls.Load() != 1 {
+		t.Fatal("restart repolled")
+	}
+	r2.checkMetadata(context.Background(), now.Add(25*time.Hour))
+	if calls.Load() != 2 || r2.usage["public"].MetadataOK || r2.usage["public"].DataUpdated.IsZero() {
+		t.Fatal("failure should retain last-known date with failure state")
+	}
+}
 
 func TestLegacyBaselineAndDurableResults(t *testing.T) {
 	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
