@@ -1,0 +1,46 @@
+name: Test and publish
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-go@fba3fb4ead8c8e09a06f1d32ae5436e5818eff15
+        with:
+          go-version: '1.26.6'
+          cache: false
+      - run: go test -race ./...
+      - run: go vet ./...
+      - name: Container health check
+        run: |
+          docker build -f Containerfile -t photon-relay:test .
+          jq 'del(.providers[1])' providers.example.json > "$RUNNER_TEMP/providers.json"
+          chmod 644 "$RUNNER_TEMP/providers.json"
+          docker run -d --name relay-test -p 127.0.0.1:18080:8080 --tmpfs /data:uid=10001,gid=10001,mode=0700 -v "$RUNNER_TEMP/providers.json:/config/providers.json:ro" photon-relay:test
+          trap 'docker rm -f relay-test' EXIT
+          curl --fail --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18080/healthz
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Publish versioned image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io' EXIT
+          docker build -f Containerfile --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" --label "org.opencontainers.image.revision=$GITHUB_SHA" --label "org.opencontainers.image.version=$VERSION" -t "ghcr.io/$GITHUB_REPOSITORY:${VERSION#v}" .
+          docker push "ghcr.io/$GITHUB_REPOSITORY:${VERSION#v}"

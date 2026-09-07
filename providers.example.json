@@ -1,0 +1,19 @@
+{
+  "providers": [
+    {
+      "name": "photon",
+      "url": "https://photon.example.org",
+      "interval_ms": 1000,
+      "daily": 1000,
+      "monthly": 20000
+    },
+    {
+      "name": "chibigeo",
+      "url": "https://app.chibigeo.com/v1/photon",
+      "key_file": "/run/secrets/chibigeo",
+      "interval_ms": 1000,
+      "daily": 2500,
+      "monthly": 0
+    }
+  ]
+}
