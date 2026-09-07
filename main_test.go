@@ -251,12 +251,31 @@ func TestWholeFailoverChainHasDeadline(t *testing.T) {
 	defer slow.Close()
 	a := p("a")
 	a.URL = slow.URL
-	r := fixture(t, a)
-	r.client = slow.Client() // No per-attempt timeout: test the outer deadline.
+	b, c, d := p("b"), p("c"), p("d")
+	b.URL, c.URL, d.URL = slow.URL, slow.URL, slow.URL
+	r := fixture(t, a, b, c, d)
+	r.client = slow.Client() // No client timeout: exercise the complete chain budget.
 	start := time.Now()
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest("GET", "/reverse?lat=0&lon=0", nil))
 	if elapsed := time.Since(start); w.Code != 503 || elapsed > 5*time.Second {
 		t.Fatalf("status=%d elapsed=%s", w.Code, elapsed)
+	}
+}
+
+func TestProviderCanUseMoreThanOldTimeout(t *testing.T) {
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(1850 * time.Millisecond)
+		io.WriteString(w, `{"type":"FeatureCollection","features":[]}`)
+	}))
+	defer s.Close()
+	a := p("a")
+	a.URL = s.URL
+	r := fixture(t, a)
+	r.client.Transport = s.Client().Transport
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/reverse?lat=0&lon=0", nil))
+	if w.Code != 200 {
+		t.Fatal(w.Code)
 	}
 }

@@ -77,7 +77,7 @@ func newRelay(c Config, state string) (*Relay, error) {
 			}
 		}
 	}
-	r := &Relay{providers: c.Providers, usage: map[string]Usage{}, state: state, slots: make(chan struct{}, 4), successes: map[string]int{}, failures: map[string]int{}, client: &http.Client{Timeout: 1700 * time.Millisecond, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	r := &Relay{providers: c.Providers, usage: map[string]Usage{}, state: state, slots: make(chan struct{}, 4), successes: map[string]int{}, failures: map[string]int{}, client: &http.Client{Timeout: 2500 * time.Millisecond, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	b, e := os.ReadFile(state)
 	if e == nil {
 		if e = json.Unmarshal(b, &r.usage); e != nil || r.usage == nil {
@@ -263,7 +263,15 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		tried[p.Name] = true
 		upstream := strings.TrimRight(p.URL, "/") + path + "?" + q.Encode()
-		out, e := http.NewRequestWithContext(ctx, http.MethodGet, upstream, nil)
+		deadline, _ := ctx.Deadline()
+		budget := time.Until(deadline)
+		// Reserve a short final fallback window when earlier attempts are slow.
+		if budget > 800*time.Millisecond {
+			budget -= 800 * time.Millisecond
+		}
+		attemptCtx, stopAttempt := context.WithTimeout(ctx, min(budget, 2500*time.Millisecond))
+		defer stopAttempt() // At most four timers, all bounded by the outer deadline.
+		out, e := http.NewRequestWithContext(attemptCtx, http.MethodGet, upstream, nil)
 		if e != nil {
 			r.failed(p, 0, "")
 			continue

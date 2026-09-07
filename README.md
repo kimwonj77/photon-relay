@@ -50,7 +50,8 @@ Only one process/replica may own the quota file. A process lock prevents shared-
 double starts. Preserve /data across updates; deleting it resets accounting.
 Corrupt or unwritable quota state fails closed. No distributed quota coordination,
 response cache, automatic requeue or provider discovery is implemented.
-Timeout is 1.7 seconds per upstream attempt; this may be too short for distant providers.
+Each upstream attempt gets at most 2.5 seconds within the 4.3-second total budget;
+later attempts preserve an 800 ms fallback window where possible. Distant providers may still time out.
 When all providers are unavailable or capped, clients receive 503, not fake empty data.
 A valid empty FeatureCollection is returned without retry.
 
